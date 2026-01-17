@@ -44,3 +44,10 @@ class Payment(Base):
     method = Column(Enum(PaymentMethod), nullable=True)
 
     client = relationship("Client", back_populates="payments")
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    key = Column(String, primary_key=True, nullable=False)
+    value = Column(String, nullable=False)
