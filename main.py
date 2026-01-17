@@ -18,7 +18,7 @@ app = FastAPI(title="Boat Storage Management API")
 # Permite que tu Frontend (localhost o Vercel) hable con el Backend
 origins = [
     "http://localhost:3000",              # Mantenlo para poder seguir desarrollando en tu PC
-    "https://front-guarderia.vercel.app"  # <--- PEGA AQUÍ EL VALOR EXACTO QUE COPIASTE
+    "https://guarderialachueca.com"  # <--- PEGA AQUÍ EL VALOR EXACTO QUE COPIASTE
 ]
 
 app.add_middleware(
