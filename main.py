@@ -19,7 +19,7 @@ app = FastAPI(title="Boat Storage Management API")
 # --- CONFIGURACIÓN DE CORS ---
 origins = [
     "http://localhost:3000",                  # Tu entorno local
-    "https://tu-proyecto-frontend.vercel.app" # ⚠️ REEMPLAZA CON TU URL REAL DE VERCEL
+    "https://front-guarderia.vercel.app" # ⚠️ REEMPLAZA CON TU URL REAL DE VERCEL
 ]
 
 app.add_middleware(
