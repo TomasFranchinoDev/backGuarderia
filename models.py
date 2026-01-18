@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, Date, Enum, ForeignKey
+from sqlalchemy import Column, String, Integer, Float, Date, Enum, ForeignKey, DateTime, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -51,3 +51,14 @@ class SystemSetting(Base):
 
     key = Column(String, primary_key=True, nullable=False)
     value = Column(String, nullable=False)
+
+class WaitingList(Base):
+    __tablename__ = "waiting_list"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    box_type = Column(String, nullable=False)
+    message = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

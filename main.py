@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import os
 
 from database import get_db, init_db
-from models import Client, Payment, ClientStatus, PaymentStatus, SystemSetting, PaymentMethod
+from models import Client, Payment, ClientStatus, PaymentStatus, SystemSetting, PaymentMethod, WaitingList
 
 
 app = FastAPI(title="Boat Storage Management API")
@@ -111,6 +111,13 @@ class ClientUpdate(BaseModel):
 
     class Config:
         from_attributes = True
+
+class WaitingListCreate(BaseModel):
+    name: str
+    email: str
+    phone: str
+    box_type: str
+    message: Optional[str] = None
 
 # --- EVENTOS DE INICIO ---
 @app.on_event("startup")
@@ -683,3 +690,23 @@ def create_payment(
             "method": new_payment.method.value if new_payment.method else None
         }
     }
+
+@app.post("/waiting-list")
+def create_waiting_list_entry(
+    entry: WaitingListCreate,
+    db: Session = Depends(get_db)
+):
+    """Registra un nuevo interesado en la lista de espera."""
+    new_entry = WaitingList(
+        name=entry.name,
+        email=entry.email,
+        phone=entry.phone,
+        box_type=entry.box_type,
+        message=entry.message
+    )
+    
+    db.add(new_entry)
+    db.commit()
+    db.refresh(new_entry)
+    
+    return {"message": "Agregado a la lista de espera exitosamente", "id": new_entry.id}
