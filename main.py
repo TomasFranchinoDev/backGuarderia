@@ -119,6 +119,18 @@ class WaitingListCreate(BaseModel):
     box_type: str
     message: Optional[str] = None
 
+class WaitingListResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    phone: str
+    box_size: str
+    message: Optional[str] = None
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
 # --- EVENTOS DE INICIO ---
 @app.on_event("startup")
 def on_startup():
@@ -690,6 +702,47 @@ def create_payment(
             "method": new_payment.method.value if new_payment.method else None
         }
     }
+
+# --- ADMIN WAITING LIST ENDPOINTS ---
+@app.get("/admin/waiting-list", response_model=List[WaitingListResponse])
+def get_waiting_list(
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin)
+):
+    """Get all waiting list entries."""
+    entries = db.query(WaitingList).order_by(WaitingList.created_at.desc()).all()
+    
+    result = []
+    for entry in entries:
+        result.append(WaitingListResponse(
+            id=entry.id,
+            name=entry.name,
+            email=entry.email,
+            phone=entry.phone,
+            box_size=entry.box_type,
+            message=entry.message,
+            created_at=entry.created_at.isoformat() if entry.created_at else None
+        ))
+    
+    return result
+
+
+@app.delete("/admin/waiting-list/{entry_id}")
+def delete_waiting_list_entry(
+    entry_id: str,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin)
+):
+    """Delete a waiting list entry."""
+    entry = db.query(WaitingList).filter(WaitingList.id == entry_id).first()
+    
+    if not entry:
+        raise HTTPException(status_code=404, detail="Waiting list entry not found")
+    
+    db.delete(entry)
+    db.commit()
+    
+    return {"message": "Waiting list entry deleted successfully", "entry_id": entry_id}
 
 @app.post("/waiting-list")
 def create_waiting_list_entry(
