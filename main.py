@@ -186,10 +186,14 @@ def calculate_financials(payments: List[Payment], monthly_fee: float):
     total_debt = 0.0
     has_discount_applied = False
 
+    current_month_base_price = monthly_fee
+    
     for payment in payments:
         if payment.status == PaymentStatus.PENDING:
             amount = payment.amount
-            
+
+            if payment.month_period == current_month_start:
+                current_month_base_price = payment.amount
             # LÓGICA CORREGIDA:
             # Solo aplicamos descuento si la cuota es de ESTE mes 
             # Y estamos antes del día 10.
@@ -209,7 +213,7 @@ def calculate_financials(payments: List[Payment], monthly_fee: float):
     ]
     
     for months, discount in plans:
-        base_total = monthly_fee * months
+        base_total = current_month_base_price * months
         final_price = base_total * (1 - discount)
         options.append(PrepaymentOption(
             months=months,
