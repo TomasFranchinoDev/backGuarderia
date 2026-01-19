@@ -6,6 +6,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta, timezone
+from dateutil.relativedelta import relativedelta
 import os
 
 from database import get_db, init_db
@@ -259,31 +260,42 @@ def get_client_by_phone(phone: str, db: Session = Depends(get_db)):
 
 @app.post("/webhook/generate-monthly-debt")
 def generate_monthly_debt(
-    x_webhook_secret: str = Header(None), # Header opcional para pruebas locales faciles
+    next_month: bool = False,  # Nuevo parámetro opcional
+    x_webhook_secret: str = Header(None),
     db: Session = Depends(get_db)
 ):
+    """
+    Genera deudas mensuales para clientes activos.
+    
+    Args:
+        next_month: Si es True, genera deudas para el próximo mes. 
+                   Si es False (default), genera para el mes actual.
+    """
     # Validación simple de seguridad
     if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
          raise HTTPException(status_code=403, detail="Invalid webhook secret")
     
     active_clients = db.query(Client).filter(Client.status == ClientStatus.ACTIVE).all()
     current_period = get_argentina_date().replace(day=1)
-    monthly_fee = get_monthly_fee(db)
     
+    # Determinar el período según el parámetro
+    target_period = current_period + relativedelta(months=1) if next_month else current_period
+    
+    monthly_fee = get_monthly_fee(db)
     created_count = 0
     
     for client in active_clients:
-        # Verificar si ya existe la cuota de este mes
+        # Verificar si ya existe la cuota para el período objetivo
         existing_payment = db.query(Payment).filter(
             Payment.client_id == client.id,
-            Payment.month_period == current_period
+            Payment.month_period == target_period
         ).first()
         
         if not existing_payment:
             new_payment = Payment(
                 client_id=client.id,
                 amount=monthly_fee,
-                month_period=current_period,
+                month_period=target_period,
                 status=PaymentStatus.PENDING
             )
             db.add(new_payment)
@@ -293,10 +305,10 @@ def generate_monthly_debt(
     
     return {
         "message": "Proceso completado",
-        "period": current_period.isoformat(),
-        "payments_created": created_count
+        "period": target_period.isoformat(),
+        "payments_created": created_count,
+        "next_month": next_month
     }
-
 
 # ========================================
 # --- ADMIN ENDPOINTS ---
