@@ -181,7 +181,7 @@ def calculate_financials(payments: List[Payment], monthly_fee: float):
     current_month_start = today.replace(day=1)
     
     # El descuento aplica si hoy es menor al día 10
-    is_before_discount_deadline = today.day < 10
+    is_before_discount_deadline = today.day < 25
     
     total_debt = 0.0
     has_discount_applied = False
