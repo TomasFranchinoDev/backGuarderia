@@ -151,7 +151,7 @@ def get_argentina_date():
 def verify_admin(x_admin_secret: str = Header(None)):
     """Verifies the admin secret header."""
     if not x_admin_secret or x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid or missing admin secret")
+        raise HTTPException(status_code=403, detail="Contraseña de administrador invalida")
     return True
 
 
@@ -182,19 +182,19 @@ def calculate_financials(payments: List[Payment], monthly_fee: float):
     current_month_start = today.replace(day=1)
     
     # El descuento aplica si hoy es menor al día 10
-    is_before_discount_deadline = today.day < 25
+    is_before_discount_deadline = today.day < 10
     
     total_debt = 0.0
     has_discount_applied = False
 
-    current_month_base_price = monthly_fee
-    
+    current_month_base_price = monthly_fee #nuevo
+
     for payment in payments:
         if payment.status == PaymentStatus.PENDING:
             amount = payment.amount
-
-            if payment.month_period == current_month_start:
-                current_month_base_price = payment.amount
+            
+            if payment.month_period == current_month_start: #nuevo
+                current_month_base_price = payment.amount #nuevo
             # LÓGICA CORREGIDA:
             # Solo aplicamos descuento si la cuota es de ESTE mes 
             # Y estamos antes del día 10.
@@ -214,7 +214,7 @@ def calculate_financials(payments: List[Payment], monthly_fee: float):
     ]
     
     for months, discount in plans:
-        base_total = current_month_base_price * months
+        base_total = current_month_base_price * months #nuevo
         final_price = base_total * (1 - discount)
         options.append(PrepaymentOption(
             months=months,
@@ -231,7 +231,7 @@ def get_client_by_phone(phone: str, db: Session = Depends(get_db)):
     client = db.query(Client).filter(Client.phone == phone).first()
     
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     monthly_fee = get_monthly_fee(db)
     current_debt, discount_applied, prepayments = calculate_financials(client.payments, monthly_fee)
@@ -273,7 +273,7 @@ def generate_monthly_debt(
     """
     # Validación simple de seguridad
     if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
-         raise HTTPException(status_code=403, detail="Invalid webhook secret")
+         raise HTTPException(status_code=403, detail="Clave de generacion invalida")
     
     active_clients = db.query(Client).filter(Client.status == ClientStatus.ACTIVE).all()
     current_period = get_argentina_date().replace(day=1)
@@ -326,7 +326,7 @@ def get_monthly_fee_admin(
     ).first()
     
     if not setting:
-        raise HTTPException(status_code=404, detail="Monthly fee not configured")
+        raise HTTPException(status_code=404, detail="Cuota mensual no configurada")
     
     return FeeResponse(key=setting.key, value=setting.value)
 
@@ -339,7 +339,7 @@ def update_monthly_fee(
 ):
     """Update the monthly fee in system settings."""
     if fee_update.fee <= 0:
-        raise HTTPException(status_code=400, detail="Fee must be greater than zero")
+        raise HTTPException(status_code=400, detail="La cuota debe ser mayor que cero")
     
     setting = db.query(SystemSetting).filter(
         SystemSetting.key == "monthly_fee"
@@ -365,7 +365,7 @@ def update_monthly_fee(
     db.commit()
     
     return {
-        "message": "Monthly fee updated successfully",
+        "message": "Cuota mensual actualizada y pagos pendientes recalculados",
         "key": setting.key,
         "value": setting.value,
         "payments_updated": len(pending_payments)
@@ -383,7 +383,7 @@ def create_client(
     # Check if phone already exists
     existing_client = db.query(Client).filter(Client.phone == client_data.phone).first()
     if existing_client:
-        raise HTTPException(status_code=400, detail="Phone already registered")
+        raise HTTPException(status_code=400, detail="Celular ya registrado")
     
     # Create new client
     new_client = Client(
@@ -423,7 +423,7 @@ def get_client_admin(
     client = db.query(Client).filter(Client.id == client_id).first()
     
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     monthly_fee = get_monthly_fee(db)
     current_debt, discount_applied, prepayments = calculate_financials(client.payments, monthly_fee)
@@ -495,13 +495,13 @@ def update_client(
     client = db.query(Client).filter(Client.id == client_id).first()
     
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     # Check if new phone is unique
     if client_data.phone and client_data.phone != client.phone:
         existing_client = db.query(Client).filter(Client.phone == client_data.phone).first()
         if existing_client:
-            raise HTTPException(status_code=400, detail="Phone already registered")
+            raise HTTPException(status_code=400, detail="Celular ya registrado")
         client.phone = client_data.phone
     
     if client_data.name:
@@ -551,7 +551,7 @@ def delete_client(
     client = db.query(Client).filter(Client.id == client_id).first()
     
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     # Delete associated payments
     db.query(Payment).filter(Payment.client_id == client_id).delete()
@@ -560,7 +560,7 @@ def delete_client(
     db.delete(client)
     db.commit()
     
-    return {"message": "Client deleted successfully", "client_id": client_id}
+    return {"message": "Cliente eliminado exitosamente", "client_id": client_id}
 
 
 # --- ADMIN PAYMENT ENDPOINTS ---
@@ -575,12 +575,12 @@ def partial_update_payment(
     payment = db.query(Payment).filter(Payment.id == payment_id).first()
     
     if not payment:
-        raise HTTPException(status_code=404, detail="Payment not found")
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
     
     # Update amount if provided
     if payment_update.amount is not None:
         if payment_update.amount < 0:
-            raise HTTPException(status_code=400, detail="Amount cannot be negative")
+            raise HTTPException(status_code=400, detail="El monto no puede ser negativo")
         payment.amount = payment_update.amount
     
     # Update status if provided
@@ -588,20 +588,20 @@ def partial_update_payment(
         try:
             payment.status = PaymentStatus(payment_update.status)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join([s.value for s in PaymentStatus])}")
+            raise HTTPException(status_code=400, detail=f"Estado inválido. Debe ser uno de: {', '.join([s.value for s in PaymentStatus])}")
     
     # Update method if provided
     if payment_update.method:
         try:
             payment.method = PaymentMethod(payment_update.method)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid method. Must be one of: {', '.join([m.value for m in PaymentMethod])}")
+            raise HTTPException(status_code=400, detail=f"Método inválido. Debe ser uno de: {', '.join([m.value for m in PaymentMethod])}")
     
     db.commit()
     db.refresh(payment)
     
     return {
-        "message": "Payment updated successfully",
+        "message": "Pago actualizado exitosamente",
         "payment": {
             "id": str(payment.id),
             "client_id": str(payment.client_id),
@@ -623,7 +623,7 @@ def get_payment_admin(
     payment = db.query(Payment).filter(Payment.id == payment_id).first()
     
     if not payment:
-        raise HTTPException(status_code=404, detail="Payment not found")
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
     
     return {
         "id": str(payment.id),
@@ -645,12 +645,12 @@ def delete_payment(
     payment = db.query(Payment).filter(Payment.id == payment_id).first()
     
     if not payment:
-        raise HTTPException(status_code=404, detail="Payment not found")
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
     
     db.delete(payment)
     db.commit()
     
-    return {"message": "Payment deleted successfully", "payment_id": payment_id}
+    return {"message": "Pago eliminado exitosamente", "payment_id": payment_id}
 
 
 @app.post("/admin/payments")
@@ -664,22 +664,22 @@ def create_payment(
     
     for field in required_fields:
         if field not in payment_data:
-            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+            raise HTTPException(status_code=400, detail=f"Falta el campo requerido: {field}")
     
     # Validate client exists
     client = db.query(Client).filter(Client.id == payment_data["client_id"]).first()
     if not client:
-        raise HTTPException(status_code=404, detail="Client not found")
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     # Validate amount
     if payment_data["amount"] < 0:
-        raise HTTPException(status_code=400, detail="Amount cannot be negative")
+        raise HTTPException(status_code=400, detail="El monto no puede ser negativo")
     
     # Validate status
     try:
         status = PaymentStatus(payment_data["status"])
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join([s.value for s in PaymentStatus])}")
+        raise HTTPException(status_code=400, detail=f"Estado inválido. Debe ser uno de: {', '.join([s.value for s in PaymentStatus])}")
     
     # Validate method if provided
     method = None
@@ -687,13 +687,13 @@ def create_payment(
         try:
             method = PaymentMethod(payment_data["method"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid method. Must be one of: {', '.join([m.value for m in PaymentMethod])}")
+            raise HTTPException(status_code=400, detail=f"Método inválido. Debe ser uno de: {', '.join([m.value for m in PaymentMethod])}")
     
     # Parse month_period
     try:
         month_period = date.fromisoformat(payment_data["month_period"])
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid month_period format. Use YYYY-MM-DD")
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD")
     
     new_payment = Payment(
         client_id=payment_data["client_id"],
@@ -708,7 +708,7 @@ def create_payment(
     db.refresh(new_payment)
     
     return {
-        "message": "Payment created successfully",
+        "message": "Pago creado exitosamente",
         "payment": {
             "id": str(new_payment.id),
             "client_id": str(new_payment.client_id),
@@ -753,12 +753,12 @@ def delete_waiting_list_entry(
     entry = db.query(WaitingList).filter(WaitingList.id == entry_id).first()
     
     if not entry:
-        raise HTTPException(status_code=404, detail="Waiting list entry not found")
+        raise HTTPException(status_code=404, detail="Entrada de lista de espera no encontrada")
     
     db.delete(entry)
     db.commit()
     
-    return {"message": "Waiting list entry deleted successfully", "entry_id": entry_id}
+    return {"message": "Entrada de lista de espera eliminada exitosamente", "entry_id": entry_id}
 
 @app.post("/waiting-list")
 def create_waiting_list_entry(
