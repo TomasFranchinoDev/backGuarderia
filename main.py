@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware  # <--- IMPORTANTE
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from datetime import datetime, date
 from typing import List, Optional
 from pydantic import BaseModel
@@ -10,25 +11,32 @@ from dateutil.relativedelta import relativedelta
 import os
 
 from database import get_db, init_db
-from models import Client, Payment, ClientStatus, PaymentStatus, SystemSetting, PaymentMethod, WaitingList
-
+from models import Client, MonthlyCharge, PaymentTransaction, ClientStatus, ChargeStatus, SystemSetting, PaymentMethod, WaitingList
 
 app = FastAPI(title="Boat Storage Management API")
 
-# --- CONFIGURACIÓN DE CORS ---
-# Permite que tu Frontend (localhost o Vercel) hable con el Backend
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)# --- CONFIGURACIÓN DE CORS ---
 origins = [
-    "http://localhost:3000",              # Mantenlo para poder seguir desarrollando en tu PC
-    "https://guarderialachueca.com"  # <--- PEGA AQUÍ EL VALOR EXACTO QUE COPIASTE
+    "http://localhost:3000",
+    "https://guarderialachueca.com"
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,      # <--- Usamos la variable 'origins', NO uses ["*"]
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(SlowAPIMiddleware)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET")
@@ -36,12 +44,21 @@ DEFAULT_MONTHLY_FEE = float(os.getenv("MONTHLY_FEE", "100.0"))
 DISCOUNT_PERCENTAGE = 0.08
 
 # --- SCHEMAS (Modelos de respuesta) ---
-class PaymentResponse(BaseModel):
+class TransactionResponse(BaseModel):
     id: str
-    amount: float
+    amount_paid: float
+    payment_date: datetime
+    method: str
+
+    class Config:
+        from_attributes = True
+
+class ChargeResponse(BaseModel):
+    id: str
+    total_amount: float
     month_period: str
     status: str
-    method: Optional[str]
+    transactions: List[TransactionResponse]
 
     class Config:
         from_attributes = True
@@ -57,10 +74,12 @@ class ClientResponse(BaseModel):
     phone: str
     box_number: int
     status: str
-    payments: List[PaymentResponse]
+    is_active: bool
+    credit_balance: float
+    charges: List[ChargeResponse]
     current_debt: float
-    has_discount_current_month: bool # Renombrado para ser preciso
-    prepayment_options: List[PrepaymentOption] # Nuevo campo
+    has_discount_current_month: bool
+    prepayment_options: List[PrepaymentOption]
 
     class Config:
         from_attributes = True
@@ -81,19 +100,55 @@ class FeeResponse(BaseModel):
     class Config:
         from_attributes = True
 
-class PaymentUpdate(BaseModel):
-    amount: Optional[float] = None
-    status: Optional[str] = None
-    method: Optional[str] = None
+class TransactionCreate(BaseModel):
+    charge_id: str
+    amount_paid: float
+    method: str
 
     class Config:
         json_schema_extra = {
             "example": {
-                "amount": 50.0,
-                "status": "PAID",
+                "charge_id": "uuid-aqui",
+                "amount_paid": 50.0,
                 "method": "TRANSFER"
             }
         }
+
+class ChargeCreate(BaseModel):
+    client_id: str
+    month_period: date
+    total_amount: float
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "client_id": "uuid-aqui",
+                "month_period": "2026-07-01",
+                "total_amount": 100.0
+            }
+        }
+
+class MetricSet(BaseModel):
+    invoiced: float
+    paid: float
+    cash: float
+    transfer: float
+
+class TopDebtor(BaseModel):
+    name: str
+    phone: str
+    debt: float
+
+class MonthlyHistory(BaseModel):
+    month: str
+    revenue: float
+
+class DashboardStatsResponse(BaseModel):
+    current_month: MetricSet
+    last_year: MetricSet
+    total_debt: float
+    top_debtors: List[TopDebtor]
+    history: List[MonthlyHistory]
 
 class ClientCreate(BaseModel):
     name: str
@@ -109,6 +164,7 @@ class ClientUpdate(BaseModel):
     phone: Optional[str] = None
     box_number: Optional[int] = None
     status: Optional[str] = None
+    is_active: Optional[bool] = None
 
     class Config:
         from_attributes = True
@@ -137,84 +193,66 @@ class WaitingListResponse(BaseModel):
 def on_startup():
     init_db()
 
-# --- EVENTOS DE INICIO ---
 @app.get("/")
 def read_root():
     return {"message": "Boat Storage Management API", "status": "running"}
 
 # --- UTILIDADES ---
 def get_argentina_date():
-    # UTC menos 3 horas
     return datetime.now(timezone(timedelta(hours=-3))).date()
 
 # --- ADMIN DEPENDENCY ---
 def verify_admin(x_admin_secret: str = Header(None)):
-    """Verifies the admin secret header."""
     if not x_admin_secret or x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Contraseña de administrador invalida")
     return True
 
-
 # --- HELPER FUNCTIONS ---
 def get_monthly_fee(db: Session) -> float:
-    """
-    Retrieves the monthly fee from the SystemSetting table.
-    Falls back to DEFAULT_MONTHLY_FEE if not found.
-    """
-    setting = db.query(SystemSetting).filter(
-        SystemSetting.key == "monthly_fee"
-    ).first()
-    
+    setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
     if setting:
         try:
             return float(setting.value)
         except ValueError:
             return DEFAULT_MONTHLY_FEE
-    
     return DEFAULT_MONTHLY_FEE
 
-
 # --- LÓGICA DE NEGOCIO ---
-def calculate_financials(payments: List[Payment], monthly_fee: float):
-    """Calcula deuda real (descuento solo en mes actual) y opciones de pago adelantado"""
+def calculate_financials(charges: List[MonthlyCharge], monthly_fee: float):
     today = get_argentina_date()
-    # Primer día del mes actual para comparar
     current_month_start = today.replace(day=1)
-    
-    # El descuento aplica si hoy es menor al día 10
     is_before_discount_deadline = today.day < 10
     
     total_debt = 0.0
     has_discount_applied = False
+    current_month_base_price = monthly_fee 
 
-    current_month_base_price = monthly_fee #nuevo
-
-    for payment in payments:
-        if payment.status == PaymentStatus.PENDING:
-            amount = payment.amount
+    for charge in charges:
+        if charge.status in [ChargeStatus.PENDING, ChargeStatus.PARTIAL]:
+            amount = charge.total_amount
             
-            if payment.month_period == current_month_start: #nuevo
-                current_month_base_price = payment.amount #nuevo
-            # LÓGICA CORREGIDA:
-            # Solo aplicamos descuento si la cuota es de ESTE mes 
-            # Y estamos antes del día 10.
-            if payment.month_period == current_month_start and is_before_discount_deadline:
+            if charge.month_period == current_month_start:
+                current_month_base_price = charge.total_amount
+                
+            if charge.month_period == current_month_start and is_before_discount_deadline:
                 amount = amount * (1 - DISCOUNT_PERCENTAGE)
                 has_discount_applied = True
             
-            total_debt += amount
+            paid_amount = sum(t.amount_paid for t in charge.transactions)
+            remaining_debt = amount - paid_amount
+            
+            if remaining_debt > 0:
+                total_debt += remaining_debt
     
-    # Calculadora de Pagos Adelantados (Precio Base * Meses * Descuento especial)
-    # Ejemplo: 3 meses 5% off, 6 meses 10% off, 12 meses 15% off
     options = []
     plans = [
-        (3, 0.083333334),  # 3 meses, 5% descuento
-        (6, 0.083333334),  # 6 meses, 10% descuento
-        (12, 0.083333334)  # 12 meses, 15% descuento
+        (3, 0.083333334),
+        (6, 0.083333334),
+        (12, 0.083333334)
     ]
     
     for months, discount in plans:
-        base_total = current_month_base_price * months #nuevo
+        base_total = current_month_base_price * months
         final_price = base_total * (1 - discount)
         options.append(PrepaymentOption(
             months=months,
@@ -225,88 +263,117 @@ def calculate_financials(payments: List[Payment], monthly_fee: float):
     return round(total_debt, 2), has_discount_applied, options
 
 
-@app.get("/clients/{phone}", response_model=ClientResponse)
-def get_client_by_phone(phone: str, db: Session = Depends(get_db)):
-    # Buscamos por teléfono (o podrías agregar lógica para ID también)
-    client = db.query(Client).filter(Client.phone == phone).first()
-    
-    if not client:
-        raise HTTPException(status_code=404, detail="Cliente no encontrado")
-    
-    monthly_fee = get_monthly_fee(db)
-    current_debt, discount_applied, prepayments = calculate_financials(client.payments, monthly_fee)
-    
+def build_client_response(client: Client, current_debt: float, has_discount: bool, prepayments: List[PrepaymentOption]) -> ClientResponse:
     return ClientResponse(
         id=str(client.id),
         name=client.name,
         phone=client.phone,
         box_number=client.box_number,
         status=client.status.value,
-        payments=[
-            PaymentResponse(
-                id=str(p.id),
-                amount=p.amount,
-                month_period=p.month_period.isoformat(),
-                status=p.status.value,
-                method=p.method.value if p.method else None
-            )
-            for p in client.payments
+        is_active=client.is_active,
+        credit_balance=client.credit_balance,
+        charges=[
+            ChargeResponse(
+                id=str(c.id),
+                total_amount=c.total_amount,
+                month_period=c.month_period.isoformat(),
+                status=c.status.value,
+                transactions=[
+                    TransactionResponse(
+                        id=str(t.id),
+                        amount_paid=t.amount_paid,
+                        payment_date=t.payment_date,
+                        method=t.method.value if t.method else None
+                    ) for t in c.transactions
+                ]
+            ) for c in client.charges
         ],
         current_debt=current_debt,
-        has_discount_current_month=discount_applied,
+        has_discount_current_month=has_discount,
         prepayment_options=prepayments
     )
 
 
+@app.get("/clients/{phone}", response_model=ClientResponse)
+@limiter.limit("30/minute")
+def get_client_by_phone(request: Request, phone: str, db: Session = Depends(get_db)):
+    client = db.query(Client).filter(Client.phone == phone, Client.is_active == True).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    
+    monthly_fee = get_monthly_fee(db)
+    current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
+    
+    return build_client_response(client, current_debt, discount_applied, prepayments)
+
+
 @app.post("/webhook/generate-monthly-debt")
 def generate_monthly_debt(
-    next_month: bool = False,  # Nuevo parámetro opcional
+    next_month: bool = False,
     x_webhook_secret: str = Header(None),
     db: Session = Depends(get_db)
 ):
-    """
-    Genera deudas mensuales para clientes activos.
-    
-    Args:
-        next_month: Si es True, genera deudas para el próximo mes. 
-                   Si es False (default), genera para el mes actual.
-    """
-    # Validación simple de seguridad
     if WEBHOOK_SECRET and x_webhook_secret != WEBHOOK_SECRET:
          raise HTTPException(status_code=403, detail="Clave de generacion invalida")
     
-    active_clients = db.query(Client).filter(Client.status == ClientStatus.ACTIVE).all()
+    active_clients = db.query(Client).filter(Client.status == ClientStatus.ACTIVE, Client.is_active == True).all()
     current_period = get_argentina_date().replace(day=1)
-    
-    # Determinar el período según el parámetro
     target_period = current_period + relativedelta(months=1) if next_month else current_period
     
     monthly_fee = get_monthly_fee(db)
     created_count = 0
+    auto_paid_count = 0
     
     for client in active_clients:
-        # Verificar si ya existe la cuota para el período objetivo
-        existing_payment = db.query(Payment).filter(
-            Payment.client_id == client.id,
-            Payment.month_period == target_period
+        existing_charge = db.query(MonthlyCharge).filter(
+            MonthlyCharge.client_id == client.id,
+            MonthlyCharge.month_period == target_period
         ).first()
         
-        if not existing_payment:
-            new_payment = Payment(
+        if not existing_charge:
+            new_charge = MonthlyCharge(
                 client_id=client.id,
-                amount=monthly_fee,
+                total_amount=monthly_fee,
                 month_period=target_period,
-                status=PaymentStatus.PENDING
+                status=ChargeStatus.PENDING
             )
-            db.add(new_payment)
+            db.add(new_charge)
+            db.flush()
+            
             created_count += 1
-    
+            
+            # Autoconsumo de Billetera Virtual
+            if client.credit_balance > 0:
+                charge_debt = monthly_fee
+                today = get_argentina_date()
+                if not next_month and today.day < 10:
+                    charge_debt = monthly_fee * (1 - DISCOUNT_PERCENTAGE)
+                
+                amount_to_consume = min(client.credit_balance, charge_debt)
+                
+                new_transaction = PaymentTransaction(
+                    charge_id=new_charge.id,
+                    amount_paid=amount_to_consume,
+                    method=PaymentMethod.TRANSFER
+                )
+                db.add(new_transaction)
+                
+                client.credit_balance -= amount_to_consume
+                
+                if amount_to_consume >= charge_debt:
+                    new_charge.status = ChargeStatus.PAID
+                else:
+                    new_charge.status = ChargeStatus.PARTIAL
+                
+                auto_paid_count += 1
+                
     db.commit()
     
     return {
         "message": "Proceso completado",
         "period": target_period.isoformat(),
-        "payments_created": created_count,
+        "charges_created": created_count,
+        "auto_paid_charges": auto_paid_count,
         "next_month": next_month
     }
 
@@ -314,37 +381,30 @@ def generate_monthly_debt(
 # --- ADMIN ENDPOINTS ---
 # ========================================
 
-# --- ADMIN SETTINGS ENDPOINTS ---
 @app.get("/admin/settings/fee", response_model=FeeResponse)
-def get_monthly_fee_admin(
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Get the current monthly fee from system settings."""
-    setting = db.query(SystemSetting).filter(
-        SystemSetting.key == "monthly_fee"
-    ).first()
+@limiter.limit("10/minute")
+def get_monthly_fee_admin(request: Request, db: Session = Depends(get_db)):
+    x_admin_secret = request.headers.get("x-admin-secret")
+    if not x_admin_secret or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Contraseña de administrador invalida")
     
+    setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
     if not setting:
         raise HTTPException(status_code=404, detail="Cuota mensual no configurada")
-    
     return FeeResponse(key=setting.key, value=setting.value)
 
 
 @app.post("/admin/settings/fee")
-def update_monthly_fee(
-    fee_update: FeeUpdate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Update the monthly fee in system settings."""
+@limiter.limit("10/minute")
+def update_monthly_fee(request: Request, fee_update: FeeUpdate, db: Session = Depends(get_db)):
+    x_admin_secret = request.headers.get("x-admin-secret")
+    if not x_admin_secret or x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Contraseña de administrador invalida")
+        
     if fee_update.fee <= 0:
         raise HTTPException(status_code=400, detail="La cuota debe ser mayor que cero")
     
-    setting = db.query(SystemSetting).filter(
-        SystemSetting.key == "monthly_fee"
-    ).first()
-    
+    setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
     if setting:
         setting.value = str(fee_update.fee)
     else:
@@ -352,45 +412,34 @@ def update_monthly_fee(
         db.add(setting)
     
     db.commit()
-    db.refresh(setting)
     
-    # Recalculate all PENDING payments with the new fee
-    pending_payments = db.query(Payment).filter(
-        Payment.status == PaymentStatus.PENDING
-    ).all()
-    
-    for payment in pending_payments:
-        payment.amount = fee_update.fee
+    pending_charges = db.query(MonthlyCharge).filter(MonthlyCharge.status == ChargeStatus.PENDING).all()
+    for charge in pending_charges:
+        charge.total_amount = fee_update.fee
     
     db.commit()
     
     return {
-        "message": "Cuota mensual actualizada y pagos pendientes recalculados",
+        "message": "Cuota mensual actualizada y cuotas pendientes recalculadas",
         "key": setting.key,
         "value": setting.value,
-        "payments_updated": len(pending_payments)
+        "charges_updated": len(pending_charges)
     }
 
 
-# --- ADMIN CLIENT CRUD ENDPOINTS ---
 @app.post("/admin/clients", response_model=ClientResponse)
-def create_client(
-    client_data: ClientCreate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Create a new client."""
-    # Check if phone already exists
+def create_client(client_data: ClientCreate, db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
     existing_client = db.query(Client).filter(Client.phone == client_data.phone).first()
     if existing_client:
         raise HTTPException(status_code=400, detail="Celular ya registrado")
     
-    # Create new client
     new_client = Client(
         name=client_data.name,
         phone=client_data.phone,
         box_number=client_data.box_number,
-        status=ClientStatus(client_data.status) if client_data.status else ClientStatus.ACTIVE
+        status=ClientStatus(client_data.status) if client_data.status else ClientStatus.ACTIVE,
+        is_active=True,
+        credit_balance=0.0
     )
     
     db.add(new_client)
@@ -398,336 +447,357 @@ def create_client(
     db.refresh(new_client)
     
     monthly_fee = get_monthly_fee(db)
-    current_debt, discount_applied, prepayments = calculate_financials(new_client.payments, monthly_fee)
+    current_debt, discount_applied, prepayments = calculate_financials([], monthly_fee)
     
-    return ClientResponse(
-        id=str(new_client.id),
-        name=new_client.name,
-        phone=new_client.phone,
-        box_number=new_client.box_number,
-        status=new_client.status.value,
-        payments=[],
-        current_debt=current_debt,
-        has_discount_current_month=discount_applied,
-        prepayment_options=prepayments
-    )
+    return build_client_response(new_client, current_debt, discount_applied, prepayments)
 
 
 @app.get("/admin/clients/{client_id}", response_model=ClientResponse)
-def get_client_admin(
-    client_id: str,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Get client details by ID (admin)."""
+def get_client_admin(client_id: str, db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
     client = db.query(Client).filter(Client.id == client_id).first()
-    
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
     monthly_fee = get_monthly_fee(db)
-    current_debt, discount_applied, prepayments = calculate_financials(client.payments, monthly_fee)
+    current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
-    return ClientResponse(
-        id=str(client.id),
-        name=client.name,
-        phone=client.phone,
-        box_number=client.box_number,
-        status=client.status.value,
-        payments=[
-            PaymentResponse(
-                id=str(p.id),
-                amount=p.amount,
-                month_period=p.month_period.isoformat(),
-                status=p.status.value,
-                method=p.method.value if p.method else None
-            )
-            for p in client.payments
-        ],
-        current_debt=current_debt,
-        has_discount_current_month=discount_applied,
-        prepayment_options=prepayments
-    )
+    return build_client_response(client, current_debt, discount_applied, prepayments)
 
-# --- AGREGAR ESTO EN main.py (Sección Admin) ---
 
-# 4. 📢 ADMIN: Listar TODOS los clientes
 @app.get("/admin/clients", response_model=List[ClientResponse])
-def get_all_clients(db: Session = Depends(get_db), _: str = Depends(verify_admin)):
-    clients = db.query(Client).options(joinedload(Client.payments)).all()
-    # Procesamos la respuesta igual que en el endpoint individual
+def get_all_clients(
+    is_active: str = Query("true", description="Filtrar por clientes activos/inactivos: 'true', 'false', 'all'. Default: 'true'"),
+    db: Session = Depends(get_db), 
+    _: str = Depends(verify_admin)
+):
+    query = db.query(Client).options(joinedload(Client.charges).joinedload(MonthlyCharge.transactions))
+    
+    val = is_active.lower()
+    if val == "true":
+        query = query.filter(Client.is_active == True)
+    elif val == "false":
+        query = query.filter(Client.is_active == False)
+        
+    clients = query.all()
     current_fee = get_monthly_fee(db)
     
     response_list = []
     for client in clients:
-        current_debt, discount_applied, prepayments = calculate_financials(client.payments, current_fee)
-        
-        response_list.append(ClientResponse(
-            id=str(client.id),
-            name=client.name,
-            phone=client.phone,
-            box_number=client.box_number,
-            status=client.status.value,
-            payments=[
-                PaymentResponse(
-                    id=str(p.id),
-                    amount=p.amount,
-                    month_period=p.month_period.isoformat(),
-                    status=p.status.value,
-                    method=p.method.value if p.method else None
-                ) for p in client.payments
-            ],
-            current_debt=current_debt,
-            has_discount_current_month=discount_applied,
-            prepayment_options=prepayments
-        ))
+        current_debt, discount_applied, prepayments = calculate_financials(client.charges, current_fee)
+        response_list.append(build_client_response(client, current_debt, discount_applied, prepayments))
     
     return response_list
 
+
 @app.put("/admin/clients/{client_id}", response_model=ClientResponse)
-def update_client(
-    client_id: str,
-    client_data: ClientUpdate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Update client information."""
+def update_client(client_id: str, client_data: ClientUpdate, db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
     client = db.query(Client).filter(Client.id == client_id).first()
-    
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
-    # Check if new phone is unique
     if client_data.phone and client_data.phone != client.phone:
         existing_client = db.query(Client).filter(Client.phone == client_data.phone).first()
         if existing_client:
             raise HTTPException(status_code=400, detail="Celular ya registrado")
         client.phone = client_data.phone
     
-    if client_data.name:
+    if client_data.name is not None:
         client.name = client_data.name
-    
     if client_data.box_number is not None:
         client.box_number = client_data.box_number
-    
-    if client_data.status:
+    if client_data.status is not None:
         client.status = ClientStatus(client_data.status)
+    if client_data.is_active is not None:
+        client.is_active = client_data.is_active
     
     db.commit()
     db.refresh(client)
     
     monthly_fee = get_monthly_fee(db)
-    current_debt, discount_applied, prepayments = calculate_financials(client.payments, monthly_fee)
+    current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
-    return ClientResponse(
-        id=str(client.id),
-        name=client.name,
-        phone=client.phone,
-        box_number=client.box_number,
-        status=client.status.value,
-        payments=[
-            PaymentResponse(
-                id=str(p.id),
-                amount=p.amount,
-                month_period=p.month_period.isoformat(),
-                status=p.status.value,
-                method=p.method.value if p.method else None
-            )
-            for p in client.payments
-        ],
-        current_debt=current_debt,
-        has_discount_current_month=discount_applied,
-        prepayment_options=prepayments
-    )
+    return build_client_response(client, current_debt, discount_applied, prepayments)
 
 
 @app.delete("/admin/clients/{client_id}")
-def delete_client(
-    client_id: str,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Delete a client and all associated payments."""
+def delete_client(client_id: str, db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
     client = db.query(Client).filter(Client.id == client_id).first()
-    
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
-    # Delete associated payments
-    db.query(Payment).filter(Payment.client_id == client_id).delete()
+    charges = db.query(MonthlyCharge).filter(MonthlyCharge.client_id == client_id).all()
+    for charge in charges:
+        db.query(PaymentTransaction).filter(PaymentTransaction.charge_id == charge.id).delete()
     
-    # Delete client
+    db.query(MonthlyCharge).filter(MonthlyCharge.client_id == client_id).delete()
     db.delete(client)
     db.commit()
     
     return {"message": "Cliente eliminado exitosamente", "client_id": client_id}
 
 
-# --- ADMIN PAYMENT ENDPOINTS ---
-@app.patch("/admin/payments/{payment_id}")
-def partial_update_payment(
-    payment_id: str,
-    payment_update: PaymentUpdate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Partially update a payment (PATCH endpoint for partial updates)."""
-    payment = db.query(Payment).filter(Payment.id == payment_id).first()
+@app.get("/admin/dashboard-stats", response_model=DashboardStatsResponse)
+def get_dashboard_stats(db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
+    today = get_argentina_date()
+    current_month_start = today.replace(day=1)
     
-    if not payment:
-        raise HTTPException(status_code=404, detail="Pago no encontrado")
+    # 1. Current Month Stats
+    invoiced_cm = db.query(func.sum(MonthlyCharge.total_amount)).filter(
+        MonthlyCharge.month_period == current_month_start
+    ).scalar() or 0.0
     
-    # Update amount if provided
-    if payment_update.amount is not None:
-        if payment_update.amount < 0:
-            raise HTTPException(status_code=400, detail="El monto no puede ser negativo")
-        payment.amount = payment_update.amount
+    transactions_cm = db.query(
+        PaymentTransaction.method, 
+        func.sum(PaymentTransaction.amount_paid)
+    ).join(MonthlyCharge).filter(
+        MonthlyCharge.month_period == current_month_start
+    ).group_by(PaymentTransaction.method).all()
     
-    # Update status if provided
-    if payment_update.status:
-        try:
-            payment.status = PaymentStatus(payment_update.status)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Estado inválido. Debe ser uno de: {', '.join([s.value for s in PaymentStatus])}")
+    cash_cm = 0.0
+    transfer_cm = 0.0
+    for method, amount in transactions_cm:
+        if method == PaymentMethod.CASH:
+            cash_cm += amount
+        else:
+            transfer_cm += amount
+    paid_cm = cash_cm + transfer_cm
     
-    # Update method if provided
-    if payment_update.method:
-        try:
-            payment.method = PaymentMethod(payment_update.method)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Método inválido. Debe ser uno de: {', '.join([m.value for m in PaymentMethod])}")
-    
-    db.commit()
-    db.refresh(payment)
-    
-    return {
-        "message": "Pago actualizado exitosamente",
-        "payment": {
-            "id": str(payment.id),
-            "client_id": str(payment.client_id),
-            "amount": payment.amount,
-            "month_period": payment.month_period.isoformat(),
-            "status": payment.status.value,
-            "method": payment.method.value if payment.method else None
-        }
-    }
-
-
-@app.get("/admin/payments/{payment_id}")
-def get_payment_admin(
-    payment_id: str,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Get payment details by ID (admin)."""
-    payment = db.query(Payment).filter(Payment.id == payment_id).first()
-    
-    if not payment:
-        raise HTTPException(status_code=404, detail="Pago no encontrado")
-    
-    return {
-        "id": str(payment.id),
-        "client_id": str(payment.client_id),
-        "amount": payment.amount,
-        "month_period": payment.month_period.isoformat(),
-        "status": payment.status.value,
-        "method": payment.method.value if payment.method else None
-    }
-
-
-@app.delete("/admin/payments/{payment_id}")
-def delete_payment(
-    payment_id: str,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Delete a payment record."""
-    payment = db.query(Payment).filter(Payment.id == payment_id).first()
-    
-    if not payment:
-        raise HTTPException(status_code=404, detail="Pago no encontrado")
-    
-    db.delete(payment)
-    db.commit()
-    
-    return {"message": "Pago eliminado exitosamente", "payment_id": payment_id}
-
-
-@app.post("/admin/payments")
-def create_payment(
-    payment_data: dict,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Create a new payment manually (admin)."""
-    required_fields = ["client_id", "amount", "month_period", "status"]
-    
-    for field in required_fields:
-        if field not in payment_data:
-            raise HTTPException(status_code=400, detail=f"Falta el campo requerido: {field}")
-    
-    # Validate client exists
-    client = db.query(Client).filter(Client.id == payment_data["client_id"]).first()
-    if not client:
-        raise HTTPException(status_code=404, detail="Cliente no encontrado")
-    
-    # Validate amount
-    if payment_data["amount"] < 0:
-        raise HTTPException(status_code=400, detail="El monto no puede ser negativo")
-    
-    # Validate status
-    try:
-        status = PaymentStatus(payment_data["status"])
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Estado inválido. Debe ser uno de: {', '.join([s.value for s in PaymentStatus])}")
-    
-    # Validate method if provided
-    method = None
-    if "method" in payment_data and payment_data["method"]:
-        try:
-            method = PaymentMethod(payment_data["method"])
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Método inválido. Debe ser uno de: {', '.join([m.value for m in PaymentMethod])}")
-    
-    # Parse month_period
-    try:
-        month_period = date.fromisoformat(payment_data["month_period"])
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD")
-    
-    new_payment = Payment(
-        client_id=payment_data["client_id"],
-        amount=payment_data["amount"],
-        month_period=month_period,
-        status=status,
-        method=method
+    current_month_stats = MetricSet(
+        invoiced=invoiced_cm,
+        paid=paid_cm,
+        cash=cash_cm,
+        transfer=transfer_cm
     )
     
-    db.add(new_payment)
+    # 2. Last Year Stats (Last 12 months)
+    one_year_ago = current_month_start - relativedelta(months=11)
+    
+    invoiced_ly = db.query(func.sum(MonthlyCharge.total_amount)).filter(
+        MonthlyCharge.month_period >= one_year_ago
+    ).scalar() or 0.0
+    
+    transactions_ly = db.query(
+        PaymentTransaction.method, 
+        func.sum(PaymentTransaction.amount_paid)
+    ).join(MonthlyCharge).filter(
+        MonthlyCharge.month_period >= one_year_ago
+    ).group_by(PaymentTransaction.method).all()
+    
+    cash_ly = 0.0
+    transfer_ly = 0.0
+    for method, amount in transactions_ly:
+        if method == PaymentMethod.CASH:
+            cash_ly += amount
+        else:
+            transfer_ly += amount
+    paid_ly = cash_ly + transfer_ly
+    
+    last_year_stats = MetricSet(
+        invoiced=invoiced_ly,
+        paid=paid_ly,
+        cash=cash_ly,
+        transfer=transfer_ly
+    )
+    
+    # 3. Total Debt & Top Debtors
+    clients = db.query(Client).filter(Client.is_active == True).options(joinedload(Client.charges).joinedload(MonthlyCharge.transactions)).all()
+    monthly_fee = get_monthly_fee(db)
+    
+    total_debt = 0.0
+    debtor_list = []
+    
+    for client in clients:
+        current_debt, _, _ = calculate_financials(client.charges, monthly_fee)
+        real_debt = max(0, current_debt - client.credit_balance)
+        total_debt += real_debt
+        
+        if real_debt > 0:
+            debtor_list.append(TopDebtor(name=client.name, phone=client.phone, debt=real_debt))
+            
+    debtor_list.sort(key=lambda x: x.debt, reverse=True)
+    top_debtors = debtor_list[:5]
+    
+    # 4. Monthly History (Last 6 months)
+    six_months_ago = current_month_start - relativedelta(months=5)
+    history_data = []
+    
+    month_names = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+    
+    for i in range(6):
+        month_cursor = six_months_ago + relativedelta(months=i)
+        month_revenue = db.query(func.sum(PaymentTransaction.amount_paid)).join(MonthlyCharge).filter(
+            MonthlyCharge.month_period == month_cursor
+        ).scalar() or 0.0
+        
+        month_str = f"{month_names[month_cursor.month - 1]} {month_cursor.year}"
+        history_data.append(MonthlyHistory(month=month_str, revenue=month_revenue))
+        
+    return DashboardStatsResponse(
+        current_month=current_month_stats,
+        last_year=last_year_stats,
+        total_debt=total_debt,
+        top_debtors=top_debtors,
+        history=history_data
+    )
+
+# --- ADMIN CHARGE ENDPOINTS ---
+@app.post("/admin/charges", response_model=ClientResponse)
+def create_manual_charge(
+    charge_data: ChargeCreate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin)
+):
+    client = db.query(Client).filter(Client.id == charge_data.client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+        
+    existing_charge = db.query(MonthlyCharge).filter(
+        MonthlyCharge.client_id == charge_data.client_id,
+        MonthlyCharge.month_period == charge_data.month_period
+    ).first()
+    
+    if existing_charge:
+        raise HTTPException(status_code=400, detail="Ya existe una cuota para este periodo")
+        
+    if charge_data.total_amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto de la cuota debe ser mayor a 0")
+        
+    new_charge = MonthlyCharge(
+        client_id=client.id,
+        total_amount=charge_data.total_amount,
+        month_period=charge_data.month_period,
+        status=ChargeStatus.PENDING
+    )
+    db.add(new_charge)
+    db.flush()
+    
+    if client.credit_balance > 0:
+        amount_to_consume = min(client.credit_balance, charge_data.total_amount)
+        new_transaction = PaymentTransaction(
+            charge_id=new_charge.id,
+            amount_paid=amount_to_consume,
+            method=PaymentMethod.TRANSFER
+        )
+        db.add(new_transaction)
+        client.credit_balance -= amount_to_consume
+        if amount_to_consume >= charge_data.total_amount:
+            new_charge.status = ChargeStatus.PAID
+        else:
+            new_charge.status = ChargeStatus.PARTIAL
+
     db.commit()
-    db.refresh(new_payment)
+    db.refresh(client)
+    
+    monthly_fee = get_monthly_fee(db)
+    current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
+    
+    return build_client_response(client, current_debt, discount_applied, prepayments)
+
+# --- ADMIN TRANSACTION ENDPOINTS ---
+@app.post("/admin/transactions")
+def create_transaction(
+    tx_data: TransactionCreate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin)
+):
+    if tx_data.amount_paid <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor que cero")
+    
+    charge = db.query(MonthlyCharge).filter(MonthlyCharge.id == tx_data.charge_id).first()
+    if not charge:
+        raise HTTPException(status_code=404, detail="Cuota no encontrada")
+        
+    try:
+        method = PaymentMethod(tx_data.method)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Método inválido. Debe ser uno de: {', '.join([m.value for m in PaymentMethod])}")
+
+    today = get_argentina_date()
+    current_month_start = today.replace(day=1)
+    is_before_discount_deadline = today.day < 10
+    
+    current_charge_debt = charge.total_amount
+    if charge.month_period == current_month_start and is_before_discount_deadline:
+        current_charge_debt = current_charge_debt * (1 - DISCOUNT_PERCENTAGE)
+        
+    paid_so_far = sum(t.amount_paid for t in charge.transactions)
+    remaining_debt = current_charge_debt - paid_so_far
+    
+    new_tx = PaymentTransaction(
+        charge_id=charge.id,
+        amount_paid=tx_data.amount_paid,
+        method=method
+    )
+    db.add(new_tx)
+    
+    client = charge.client
+    
+    if tx_data.amount_paid >= remaining_debt:
+        charge.status = ChargeStatus.PAID
+        excess = tx_data.amount_paid - remaining_debt
+        if excess > 0:
+            client.credit_balance += excess
+    else:
+        charge.status = ChargeStatus.PARTIAL
+        
+    db.commit()
+    db.refresh(new_tx)
+    db.refresh(charge)
     
     return {
-        "message": "Pago creado exitosamente",
-        "payment": {
-            "id": str(new_payment.id),
-            "client_id": str(new_payment.client_id),
-            "amount": new_payment.amount,
-            "month_period": new_payment.month_period.isoformat(),
-            "status": new_payment.status.value,
-            "method": new_payment.method.value if new_payment.method else None
-        }
+        "message": "Transacción registrada exitosamente",
+        "transaction_id": str(new_tx.id),
+        "charge_status": charge.status.value,
+        "new_credit_balance": client.credit_balance
+    }
+
+@app.delete("/admin/transactions/{tx_id}")
+def delete_transaction(tx_id: str, db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
+    tx = db.query(PaymentTransaction).filter(PaymentTransaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transacción no encontrada")
+        
+    charge = tx.charge
+    client = charge.client
+    
+    today = get_argentina_date()
+    current_month_start = today.replace(day=1)
+    is_before_discount_deadline = today.day < 10
+    
+    current_charge_debt = charge.total_amount
+    if charge.month_period == current_month_start and is_before_discount_deadline:
+        current_charge_debt = current_charge_debt * (1 - DISCOUNT_PERCENTAGE)
+        
+    total_paid_before = sum(t.amount_paid for t in charge.transactions)
+    total_paid_after = total_paid_before - tx.amount_paid
+    
+    excess_before = max(0.0, total_paid_before - current_charge_debt)
+    excess_after = max(0.0, total_paid_after - current_charge_debt)
+    
+    excess_to_remove = excess_before - excess_after
+    if excess_to_remove > 0:
+        client.credit_balance -= excess_to_remove
+        
+    if total_paid_after >= current_charge_debt:
+        charge.status = ChargeStatus.PAID
+    elif total_paid_after > 0:
+        charge.status = ChargeStatus.PARTIAL
+    else:
+        charge.status = ChargeStatus.PENDING
+        
+    db.delete(tx)
+    db.commit()
+    
+    return {
+        "message": "Transacción eliminada exitosamente",
+        "charge_status": charge.status.value,
+        "new_credit_balance": client.credit_balance
     }
 
 # --- ADMIN WAITING LIST ENDPOINTS ---
 @app.get("/admin/waiting-list", response_model=List[WaitingListResponse])
-def get_waiting_list(
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Get all waiting list entries."""
+def get_waiting_list(db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
     entries = db.query(WaitingList).order_by(WaitingList.created_at.desc()).all()
-    
     result = []
     for entry in entries:
         result.append(WaitingListResponse(
@@ -739,33 +809,20 @@ def get_waiting_list(
             message=entry.message,
             created_at=entry.created_at.isoformat() if entry.created_at else None
         ))
-    
     return result
 
-
 @app.delete("/admin/waiting-list/{entry_id}")
-def delete_waiting_list_entry(
-    entry_id: str,
-    db: Session = Depends(get_db),
-    _: bool = Depends(verify_admin)
-):
-    """Delete a waiting list entry."""
+def delete_waiting_list_entry(entry_id: str, db: Session = Depends(get_db), _: bool = Depends(verify_admin)):
     entry = db.query(WaitingList).filter(WaitingList.id == entry_id).first()
-    
     if not entry:
         raise HTTPException(status_code=404, detail="Entrada de lista de espera no encontrada")
-    
     db.delete(entry)
     db.commit()
-    
     return {"message": "Entrada de lista de espera eliminada exitosamente", "entry_id": entry_id}
 
 @app.post("/waiting-list")
-def create_waiting_list_entry(
-    entry: WaitingListCreate,
-    db: Session = Depends(get_db)
-):
-    """Registra un nuevo interesado en la lista de espera."""
+@limiter.limit("5/minute")
+def create_waiting_list_entry(request: Request, entry: WaitingListCreate, db: Session = Depends(get_db)):
     new_entry = WaitingList(
         name=entry.name,
         email=entry.email,
@@ -773,9 +830,7 @@ def create_waiting_list_entry(
         box_type=entry.box_type,
         message=entry.message
     )
-    
     db.add(new_entry)
     db.commit()
     db.refresh(new_entry)
-    
     return {"message": "Agregado a la lista de espera exitosamente", "id": new_entry.id}
