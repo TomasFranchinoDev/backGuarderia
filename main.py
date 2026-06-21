@@ -617,14 +617,14 @@ def get_dashboard_stats(db: Session = Depends(get_db), _: bool = Depends(verify_
     debtor_list.sort(key=lambda x: x.debt, reverse=True)
     top_debtors = debtor_list[:5]
     
-    # 4. Monthly History (Last 6 months)
-    six_months_ago = current_month_start - relativedelta(months=5)
+    # 4. Monthly History (Last 12 months)
+    twelve_months_ago = current_month_start - relativedelta(months=11)
     history_data = []
     
     month_names = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
     
-    for i in range(6):
-        month_cursor = six_months_ago + relativedelta(months=i)
+    for i in range(12):
+        month_cursor = twelve_months_ago + relativedelta(months=i)
         month_revenue = db.query(func.sum(PaymentTransaction.amount_paid)).join(MonthlyCharge).filter(
             MonthlyCharge.month_period == month_cursor
         ).scalar() or 0.0
