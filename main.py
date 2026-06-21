@@ -143,12 +143,27 @@ class MonthlyHistory(BaseModel):
     month: str
     revenue: float
 
+class WaitlistCandidate(BaseModel):
+    name: str
+    phone: str
+    box_size: str
+
+class OccupancyStats(BaseModel):
+    occupancy_rate: float
+    available_boxes: int
+    occupied_boxes: int
+    total_rentable_boxes: int
+    potential_revenue: float
+    waitlist_count: int
+    top_waitlist: List[WaitlistCandidate]
+
 class DashboardStatsResponse(BaseModel):
     current_month: MetricSet
     last_year: MetricSet
     total_debt: float
     top_debtors: List[TopDebtor]
     history: List[MonthlyHistory]
+    occupancy: OccupancyStats
 
 class ClientCreate(BaseModel):
     name: str
@@ -632,12 +647,39 @@ def get_dashboard_stats(db: Session = Depends(get_db), _: bool = Depends(verify_
         month_str = f"{month_names[month_cursor.month - 1]} {month_cursor.year}"
         history_data.append(MonthlyHistory(month=month_str, revenue=month_revenue))
         
+    # 5. Occupancy & Operations Stats
+    total_rentable_boxes = 26
+    
+    occupied_boxes = db.query(Client).filter(
+        Client.is_active == True,
+        Client.box_number > 3
+    ).count()
+    
+    available_boxes = max(0, total_rentable_boxes - occupied_boxes)
+    occupancy_rate = (occupied_boxes / total_rentable_boxes) * 100 if total_rentable_boxes > 0 else 0
+    potential_revenue = total_rentable_boxes * monthly_fee
+    
+    waitlist_count = db.query(WaitingList).count()
+    top_waitlist_db = db.query(WaitingList).order_by(WaitingList.created_at.asc()).limit(3).all()
+    top_waitlist = [WaitlistCandidate(name=w.name, phone=w.phone, box_size=w.box_type) for w in top_waitlist_db]
+    
+    occupancy_stats = OccupancyStats(
+        occupancy_rate=round(occupancy_rate, 2),
+        available_boxes=available_boxes,
+        occupied_boxes=occupied_boxes,
+        total_rentable_boxes=total_rentable_boxes,
+        potential_revenue=potential_revenue,
+        waitlist_count=waitlist_count,
+        top_waitlist=top_waitlist
+    )
+        
     return DashboardStatsResponse(
         current_month=current_month_stats,
         last_year=last_year_stats,
         total_debt=total_debt,
         top_debtors=top_debtors,
-        history=history_data
+        history=history_data,
+        occupancy=occupancy_stats
     )
 
 # --- ADMIN CHARGE ENDPOINTS ---
