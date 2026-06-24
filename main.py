@@ -114,6 +114,18 @@ class TransactionCreate(BaseModel):
             }
         }
 
+class ClientTransactionCreate(BaseModel):
+    amount_paid: float
+    method: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "amount_paid": 100000.0,
+                "method": "TRANSFER"
+            }
+        }
+
 class ChargeCreate(BaseModel):
     client_id: str
     month_period: date
@@ -241,20 +253,26 @@ def calculate_financials(charges: List[MonthlyCharge], monthly_fee: float):
     total_debt = 0.0
     has_discount_applied = False
     current_month_base_price = monthly_fee 
+    
+    sorted_charges = sorted(charges, key=lambda c: c.month_period)
+    has_previous_debt = False
 
-    for charge in charges:
+    for charge in sorted_charges:
         if charge.status in [ChargeStatus.PENDING, ChargeStatus.PARTIAL]:
             amount = charge.total_amount
+            paid_amount = sum(t.amount_paid for t in charge.transactions)
+            remaining_debt = amount - paid_amount
+            
+            if charge.month_period < current_month_start and remaining_debt > 0:
+                has_previous_debt = True
             
             if charge.month_period == current_month_start:
                 current_month_base_price = charge.total_amount
                 
-            if charge.month_period == current_month_start and is_before_discount_deadline:
+            if charge.month_period == current_month_start and is_before_discount_deadline and not has_previous_debt:
                 amount = amount * (1 - DISCOUNT_PERCENTAGE)
                 has_discount_applied = True
-            
-            paid_amount = sum(t.amount_paid for t in charge.transactions)
-            remaining_debt = amount - paid_amount
+                remaining_debt = amount - paid_amount
             
             if remaining_debt > 0:
                 total_debt += remaining_debt
@@ -361,7 +379,14 @@ def generate_monthly_debt(
             if client.credit_balance > 0:
                 charge_debt = monthly_fee
                 today = get_argentina_date()
-                if not next_month and today.day < 10:
+                
+                has_previous_debt = any(
+                    c.status in [ChargeStatus.PENDING, ChargeStatus.PARTIAL] 
+                    and c.month_period < target_period 
+                    for c in client.charges
+                )
+                
+                if not next_month and today.day < 10 and not has_previous_debt:
                     charge_debt = monthly_fee * (1 - DISCOUNT_PERCENTAGE)
                 
                 amount_to_consume = min(client.credit_balance, charge_debt)
@@ -734,6 +759,85 @@ def create_manual_charge(
     current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
     return build_client_response(client, current_debt, discount_applied, prepayments)
+
+@app.post("/admin/clients/{client_id}/transactions")
+def create_client_transaction(
+    client_id: str,
+    tx_data: ClientTransactionCreate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin)
+):
+    if tx_data.amount_paid <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor que cero")
+        
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+        
+    try:
+        method = PaymentMethod(tx_data.method)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Método inválido. Debe ser uno de: {', '.join([m.value for m in PaymentMethod])}")
+
+    today = get_argentina_date()
+    current_month_start = today.replace(day=1)
+    is_before_discount_deadline = today.day < 10
+    
+    pending_charges = [c for c in client.charges if c.status in [ChargeStatus.PENDING, ChargeStatus.PARTIAL]]
+    sorted_charges = sorted(pending_charges, key=lambda c: c.month_period)
+    
+    remaining_payment = tx_data.amount_paid
+    created_txs = []
+    
+    has_previous_debt = False
+    for charge in sorted_charges:
+        paid_so_far = sum(t.amount_paid for t in charge.transactions)
+        remaining_debt = charge.total_amount - paid_so_far
+        if charge.month_period < current_month_start and remaining_debt > 0:
+            has_previous_debt = True
+            break
+            
+    for charge in sorted_charges:
+        if remaining_payment <= 0:
+            break
+            
+        current_charge_debt = charge.total_amount
+        if charge.month_period == current_month_start and is_before_discount_deadline and not has_previous_debt:
+            current_charge_debt = current_charge_debt * (1 - DISCOUNT_PERCENTAGE)
+            
+        paid_so_far = sum(t.amount_paid for t in charge.transactions)
+        remaining_debt = current_charge_debt - paid_so_far
+        
+        if remaining_debt <= 0:
+            continue
+            
+        amount_to_apply = min(remaining_payment, remaining_debt)
+        
+        new_tx = PaymentTransaction(
+            charge_id=charge.id,
+            amount_paid=amount_to_apply,
+            method=method
+        )
+        db.add(new_tx)
+        created_txs.append(new_tx)
+        
+        if amount_to_apply >= remaining_debt:
+            charge.status = ChargeStatus.PAID
+        else:
+            charge.status = ChargeStatus.PARTIAL
+            
+        remaining_payment -= amount_to_apply
+        
+    if remaining_payment > 0:
+        client.credit_balance += remaining_payment
+        
+    db.commit()
+    
+    return {
+        "message": "Pago registrado exitosamente",
+        "applied_transactions": len(created_txs),
+        "new_credit_balance": client.credit_balance
+    }
 
 # --- ADMIN TRANSACTION ENDPOINTS ---
 @app.post("/admin/transactions")
