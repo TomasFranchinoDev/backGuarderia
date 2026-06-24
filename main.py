@@ -86,16 +86,17 @@ class ClientResponse(BaseModel):
 
 # --- ADMIN SCHEMAS ---
 class FeeUpdate(BaseModel):
-    fee: float
+    fee_small: float
+    fee_large: float
 
     class Config:
         json_schema_extra = {
-            "example": {"fee": 150.0}
+            "example": {"fee_small": 60000.0, "fee_large": 65000.0}
         }
 
 class FeeResponse(BaseModel):
-    key: str
-    value: str
+    fee_small: float
+    fee_large: float
 
     class Config:
         from_attributes = True
@@ -235,14 +236,31 @@ def verify_admin(x_admin_secret: str = Header(None)):
     return True
 
 # --- HELPER FUNCTIONS ---
-def get_monthly_fee(db: Session) -> float:
-    setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
-    if setting:
-        try:
-            return float(setting.value)
-        except ValueError:
-            return DEFAULT_MONTHLY_FEE
-    return DEFAULT_MONTHLY_FEE
+def get_monthly_fees(db: Session) -> tuple[float, float]:
+    fee_small = DEFAULT_MONTHLY_FEE
+    fee_large = DEFAULT_MONTHLY_FEE
+    settings = db.query(SystemSetting).filter(SystemSetting.key.in_(["monthly_fee_small", "monthly_fee_large"])).all()
+    for s in settings:
+        if s.key == "monthly_fee_small":
+            try: fee_small = float(s.value)
+            except ValueError: pass
+        elif s.key == "monthly_fee_large":
+            try: fee_large = float(s.value)
+            except ValueError: pass
+    
+    # Retrocompatibilidad: si no existe small/large, buscar el viejo 'monthly_fee'
+    if not settings:
+        old_setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
+        if old_setting:
+            try:
+                val = float(old_setting.value)
+                return val, val
+            except ValueError: pass
+            
+    return fee_small, fee_large
+
+def get_fee_for_box(fee_small: float, fee_large: float, box_number: int) -> float:
+    return fee_large if 1 <= box_number <= 10 else fee_small
 
 # --- LÓGICA DE NEGOCIO ---
 def calculate_financials(charges: List[MonthlyCharge], monthly_fee: float):
@@ -334,7 +352,8 @@ def get_client_by_phone(request: Request, phone: str, db: Session = Depends(get_
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
+    monthly_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
     current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
     return build_client_response(client, current_debt, discount_applied, prepayments)
@@ -353,11 +372,13 @@ def generate_monthly_debt(
     current_period = get_argentina_date().replace(day=1)
     target_period = current_period + relativedelta(months=1) if next_month else current_period
     
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
     created_count = 0
     auto_paid_count = 0
     
     for client in active_clients:
+        client_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
+        
         existing_charge = db.query(MonthlyCharge).filter(
             MonthlyCharge.client_id == client.id,
             MonthlyCharge.month_period == target_period
@@ -366,7 +387,7 @@ def generate_monthly_debt(
         if not existing_charge:
             new_charge = MonthlyCharge(
                 client_id=client.id,
-                total_amount=monthly_fee,
+                total_amount=client_fee,
                 month_period=target_period,
                 status=ChargeStatus.PENDING
             )
@@ -377,7 +398,7 @@ def generate_monthly_debt(
             
             # Autoconsumo de Billetera Virtual
             if client.credit_balance > 0:
-                charge_debt = monthly_fee
+                charge_debt = client_fee
                 today = get_argentina_date()
                 
                 has_previous_debt = any(
@@ -387,7 +408,7 @@ def generate_monthly_debt(
                 )
                 
                 if not next_month and today.day < 10 and not has_previous_debt:
-                    charge_debt = monthly_fee * (1 - DISCOUNT_PERCENTAGE)
+                    charge_debt = client_fee * (1 - DISCOUNT_PERCENTAGE)
                 
                 amount_to_consume = min(client.credit_balance, charge_debt)
                 
@@ -428,10 +449,8 @@ def get_monthly_fee_admin(request: Request, db: Session = Depends(get_db)):
     if not x_admin_secret or x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Contraseña de administrador invalida")
     
-    setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
-    if not setting:
-        raise HTTPException(status_code=404, detail="Cuota mensual no configurada")
-    return FeeResponse(key=setting.key, value=setting.value)
+    fee_small, fee_large = get_monthly_fees(db)
+    return FeeResponse(fee_small=fee_small, fee_large=fee_large)
 
 
 @app.post("/admin/settings/fee")
@@ -441,28 +460,43 @@ def update_monthly_fee(request: Request, fee_update: FeeUpdate, db: Session = De
     if not x_admin_secret or x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Contraseña de administrador invalida")
         
-    if fee_update.fee <= 0:
+    if fee_update.fee_small <= 0 or fee_update.fee_large <= 0:
         raise HTTPException(status_code=400, detail="La cuota debe ser mayor que cero")
     
-    setting = db.query(SystemSetting).filter(SystemSetting.key == "monthly_fee").first()
-    if setting:
-        setting.value = str(fee_update.fee)
-    else:
-        setting = SystemSetting(key="monthly_fee", value=str(fee_update.fee))
-        db.add(setting)
+    def _update_or_create(key, value):
+        setting = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        if setting:
+            setting.value = str(value)
+        else:
+            db.add(SystemSetting(key=key, value=str(value)))
+            
+    _update_or_create("monthly_fee_small", fee_update.fee_small)
+    _update_or_create("monthly_fee_large", fee_update.fee_large)
     
     db.commit()
     
-    pending_charges = db.query(MonthlyCharge).filter(MonthlyCharge.status == ChargeStatus.PENDING).all()
+    pending_charges = db.query(MonthlyCharge).join(Client).filter(
+        MonthlyCharge.status.in_([ChargeStatus.PENDING, ChargeStatus.PARTIAL])
+    ).all()
+    
     for charge in pending_charges:
-        charge.total_amount = fee_update.fee
+        new_fee = fee_update.fee_large if 1 <= charge.client.box_number <= 10 else fee_update.fee_small
+        charge.total_amount = new_fee
+        
+        if charge.status == ChargeStatus.PARTIAL:
+            paid_so_far = sum(t.amount_paid for t in charge.transactions)
+            if paid_so_far >= new_fee:
+                charge.status = ChargeStatus.PAID
+                excess = paid_so_far - new_fee
+                if excess > 0:
+                    charge.client.credit_balance += excess
     
     db.commit()
     
     return {
         "message": "Cuota mensual actualizada y cuotas pendientes recalculadas",
-        "key": setting.key,
-        "value": setting.value,
+        "fee_small": fee_update.fee_small,
+        "fee_large": fee_update.fee_large,
         "charges_updated": len(pending_charges)
     }
 
@@ -486,7 +520,8 @@ def create_client(client_data: ClientCreate, db: Session = Depends(get_db), _: b
     db.commit()
     db.refresh(new_client)
     
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
+    monthly_fee = get_fee_for_box(fee_small, fee_large, new_client.box_number)
     current_debt, discount_applied, prepayments = calculate_financials([], monthly_fee)
     
     return build_client_response(new_client, current_debt, discount_applied, prepayments)
@@ -498,7 +533,8 @@ def get_client_admin(client_id: str, db: Session = Depends(get_db), _: bool = De
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
+    monthly_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
     current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
     return build_client_response(client, current_debt, discount_applied, prepayments)
@@ -519,10 +555,11 @@ def get_all_clients(
         query = query.filter(Client.is_active == False)
         
     clients = query.all()
-    current_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
     
     response_list = []
     for client in clients:
+        current_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
         current_debt, discount_applied, prepayments = calculate_financials(client.charges, current_fee)
         response_list.append(build_client_response(client, current_debt, discount_applied, prepayments))
     
@@ -553,7 +590,8 @@ def update_client(client_id: str, client_data: ClientUpdate, db: Session = Depen
     db.commit()
     db.refresh(client)
     
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
+    monthly_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
     current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
     return build_client_response(client, current_debt, discount_applied, prepayments)
@@ -641,12 +679,13 @@ def get_dashboard_stats(db: Session = Depends(get_db), _: bool = Depends(verify_
     
     # 3. Total Debt & Top Debtors
     clients = db.query(Client).filter(Client.is_active == True).options(joinedload(Client.charges).joinedload(MonthlyCharge.transactions)).all()
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
     
     total_debt = 0.0
     debtor_list = []
     
     for client in clients:
+        monthly_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
         current_debt, _, _ = calculate_financials(client.charges, monthly_fee)
         real_debt = max(0, current_debt - client.credit_balance)
         total_debt += real_debt
@@ -682,7 +721,7 @@ def get_dashboard_stats(db: Session = Depends(get_db), _: bool = Depends(verify_
     
     available_boxes = max(0, total_rentable_boxes - occupied_boxes)
     occupancy_rate = (occupied_boxes / total_rentable_boxes) * 100 if total_rentable_boxes > 0 else 0
-    potential_revenue = total_rentable_boxes * monthly_fee
+    potential_revenue = (7 * fee_large) + (19 * fee_small)
     
     waitlist_count = db.query(WaitingList).count()
     top_waitlist_db = db.query(WaitingList).order_by(WaitingList.created_at.asc()).limit(3).all()
@@ -755,7 +794,8 @@ def create_manual_charge(
     db.commit()
     db.refresh(client)
     
-    monthly_fee = get_monthly_fee(db)
+    fee_small, fee_large = get_monthly_fees(db)
+    monthly_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
     current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
     
     return build_client_response(client, current_debt, discount_applied, prepayments)
