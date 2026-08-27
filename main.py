@@ -141,6 +141,16 @@ class ChargeCreate(BaseModel):
             }
         }
 
+class ChargeUpdate(BaseModel):
+    total_amount: float
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "total_amount": 100.0
+            }
+        }
+
 class MetricSet(BaseModel):
     invoiced: float
     paid: float
@@ -791,6 +801,54 @@ def create_manual_charge(
         else:
             new_charge.status = ChargeStatus.PARTIAL
 
+    db.commit()
+    db.refresh(client)
+    
+    fee_small, fee_large = get_monthly_fees(db)
+    monthly_fee = get_fee_for_box(fee_small, fee_large, client.box_number)
+    current_debt, discount_applied, prepayments = calculate_financials(client.charges, monthly_fee)
+    
+    return build_client_response(client, current_debt, discount_applied, prepayments)
+
+@app.put("/admin/charges/{charge_id}", response_model=ClientResponse)
+def update_charge_amount(
+    charge_id: str,
+    charge_data: ChargeUpdate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin)
+):
+    if charge_data.total_amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto de la cuota debe ser mayor a 0")
+        
+    charge = db.query(MonthlyCharge).filter(MonthlyCharge.id == charge_id).first()
+    if not charge:
+        raise HTTPException(status_code=404, detail="Cuota no encontrada")
+        
+    client = charge.client
+    old_amount = charge.total_amount
+    new_amount = charge_data.total_amount
+    
+    charge.total_amount = new_amount
+    
+    paid_so_far = sum(t.amount_paid for t in charge.transactions)
+    
+    if paid_so_far >= new_amount:
+        charge.status = ChargeStatus.PAID
+        excess_before = max(0.0, paid_so_far - old_amount)
+        excess_after = max(0.0, paid_so_far - new_amount)
+        diff_excess = excess_after - excess_before
+        if diff_excess > 0:
+            client.credit_balance += diff_excess
+        elif diff_excess < 0:
+            client.credit_balance = max(0.0, client.credit_balance + diff_excess)
+    elif paid_so_far > 0:
+        charge.status = ChargeStatus.PARTIAL
+        excess_before = max(0.0, paid_so_far - old_amount)
+        if excess_before > 0:
+            client.credit_balance = max(0.0, client.credit_balance - excess_before)
+    else:
+        charge.status = ChargeStatus.PENDING
+        
     db.commit()
     db.refresh(client)
     
